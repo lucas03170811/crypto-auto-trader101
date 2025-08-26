@@ -72,6 +72,10 @@ class Exchange:
                 type=order_type,
                 quantity=quantity
             )
+                def health_check(self):
+        """兼容 main.py 用的健康檢查"""
+        return self.test_connection()
+
             print(f"[TRADE] 下單成功 -> {order}")
             return order
         except BinanceAPIException as e:
