@@ -1,4 +1,3 @@
-
 import pandas as pd
 
 def ema(series: pd.Series, period: int) -> pd.Series:
