@@ -1,5 +1,4 @@
 import os
-import time
 from binance.client import Client
 from binance.exceptions import BinanceAPIException, BinanceOrderException
 
@@ -27,16 +26,24 @@ class Exchange:
         try:
             info = self.client.futures_account()
             return info
-        except BinanceAPIException as e:
-            print(f"[ERROR] API 驗證失敗: {e}")
-            return None
         except Exception as e:
-            print(f"[ERROR] 未知錯誤: {e}")
+            print(f"[ERROR] API 驗證失敗: {e}")
             return None
 
     def health_check(self):
         """兼容 main.py 用的健康檢查"""
         return self.test_connection()
+
+    def set_one_way_mode(self):
+        """設定成單向持倉模式"""
+        try:
+            res = self.client.futures_change_position_mode(dualSidePosition=False)
+            print("[INFO] 已切換為單向持倉模式")
+            return res
+        except BinanceAPIException as e:
+            print(f"[WARN] 設定單向持倉模式失敗: {e}")
+        except Exception as e:
+            print(f"[WARN] 設定單向持倉模式未知錯誤: {e}")
 
     def get_balance(self, asset="USDT"):
         try:
