@@ -1,38 +1,233 @@
-import os
-from exchange import Exchange
+import os, time, math, sys
+from typing import List, Dict, Any
+import pandas as pd
+from dotenv import load_dotenv
+from binance.exceptions import BinanceAPIException
 
-from strategies.trend import generate_trend_signal
-from strategies.revert import generate_revert_signal
+from exchange import Exchange
+from utils.state import load_state, save_state
+from strategy.trend import build_df, generate_signal, initial_stop, trail_stop, should_pyramid
+
+load_dotenv()
+
+# -------- 關鍵：寫死為主網 --------
+TESTNET = False            # ★ 固定主網。若要測試網，手動改成 True
+# -------------------------------
+
+API_KEY = os.getenv("BINANCE_API_KEY", "")
+API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+EXIT_ON_AUTH_ERROR = os.getenv("EXIT_ON_AUTH_ERROR", "true").lower() == "true"
+
+# 交易參數
+BASE_EQUITY = float(os.getenv("BASE_EQUITY", "20"))
+RISK_PCT = float(os.getenv("RISK_PCT", "0.02"))
+LEVERAGE = int(os.getenv("LEVERAGE", "30"))
+TIMEFRAME = os.getenv("TIMEFRAME", "5m")
+MAX_PARALLEL_SYMBOLS = int(os.getenv("MAX_PARALLEL_SYMBOLS", "6"))
+
+# 指標參數
+ATR_LEN = int(os.getenv("ATR_LEN", "14"))
+ATR_MULT_SL = float(os.getenv("ATR_MULT_SL", "1.5"))
+ATR_MULT_TRAIL = float(os.getenv("ATR_MULT_TRAIL", "2.0"))
+DONCHIAN_LEN = int(os.getenv("DONCHIAN_LEN", "20"))
+EMA_FAST = int(os.getenv("EMA_FAST", "50"))
+EMA_SLOW = int(os.getenv("EMA_SLOW", "200"))
+
+LOOP_SLEEP_SECS = int(os.getenv("LOOP_SLEEP_SECS", "30"))
+
+DEFAULT_SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","TONUSDT","SUIUSDT","SEIUSDT","XRPUSDT","DOGEUSDT"]
+
+def pick_symbols(ex: Exchange) -> List[str]:
+    symbols_str = os.getenv("SYMBOLS", "").strip()
+    if symbols_str:
+        raw = [s.strip().upper() for s in symbols_str.split(",") if s.strip()]
+    else:
+        raw = DEFAULT_SYMBOLS.copy()
+        try:
+            top = ex.top_symbols_by_quote_volume(limit=20)
+            for s in top:
+                if s not in raw and s.endswith("USDT"):
+                    raw.append(s)
+        except Exception:
+            pass
+    return raw[:MAX_PARALLEL_SYMBOLS]
+
+def compute_position_size(equity: float, risk_pct: float, atr_val: float, entry_price: float,
+                          side: str, symbol: str, ex: Exchange) -> float:
+    """
+    口數 = min( 風險金額/停損距離 , 最大可用名義/價格 )
+    並對齊 stepSize；確保 >= MIN_NOTIONAL
+    """
+    risk_amount = max(0.5, equity * risk_pct)  # 最少風險 0.5U，避免太小單
+    stop_price = initial_stop(entry_price, atr_val, side, ATR_MULT_SL)
+    stop_dist = abs(entry_price - stop_price)
+    if stop_dist <= 0:
+        return 0.0
+
+    qty_by_risk = risk_amount / stop_dist
+    max_notional = max(0.0, equity * LEVERAGE * 0.95)
+    max_qty_by_margin = max_notional / entry_price if entry_price > 0 else 0.0
+    qty = min(qty_by_risk, max_qty_by_margin)
+    qty = ex.round_qty(symbol, qty)
+
+    min_notional = ex.min_notional(symbol)
+    if min_notional and qty * entry_price < min_notional:
+        qty = ex.round_qty(symbol, (min_notional / entry_price) * 1.05)
+
+    return qty
+
+def place_entry_and_sl(ex: Exchange, symbol: str, side: str, qty: float, entry_price: float, atr_val: float):
+    if qty <= 0:
+        print(f"[{symbol}] qty too small, skip."); return None
+    if DRY_RUN:
+        print(f"[DRY_RUN] {symbol} {side} MARKET qty={qty}")
+        return {"orderId":"DRY","side":side,"qty":qty,"price":entry_price}
+
+    resp = ex.new_market_order(symbol=symbol, side=("BUY" if side=="LONG" else "SELL"), quantity=qty)
+    stop_price = initial_stop(entry_price, atr_val, side, ATR_MULT_SL)
+    ex.cancel_all(symbol)
+    ex.new_stop_market_close(symbol=symbol, side=side, stop_price=stop_price)
+    return resp
+
+def manage_trailing_and_pyramid(ex: Exchange, symbol: str, side: str, df: pd.DataFrame, pos_state: Dict[str, Any]):
+    last = df.iloc[-1]
+    highest = df["high"].rolling(window=100, min_periods=1).max().iloc[-1]
+    lowest = df["low"].rolling(window=100, min_periods=1).min().iloc[-1]
+
+    atr_val = last["atr"]
+    if math.isnan(atr_val) or atr_val <= 0:
+        return
+
+    new_trail = trail_stop(highest, lowest, atr_val, side, ATR_MULT_TRAIL)
+    prev_trail = pos_state.get("trail", None)
+    entry_price = pos_state.get("entry_price", last["close"])
+    adds_done = pos_state.get("adds_done", 0)
+    last_add_price = pos_state.get("last_add_price", entry_price)
+
+    # 移動停損（只朝有利方向移動）
+    if prev_trail is None or (side=='LONG' and new_trail > prev_trail) or (side=='SHORT' and new_trail < prev_trail):
+        if DRY_RUN:
+            print(f"[DRY_RUN] {symbol} Update trail to {new_trail}")
+        else:
+            ex.cancel_all(symbol)
+            ex.new_stop_market_close(symbol=symbol, side=side, stop_price=new_trail)
+        pos_state["trail"] = new_trail
+
+    # 滾倉/加碼（每 1×ATR）
+    price = last["close"]
+    if should_pyramid(side, price, last_add_price, atr_val, step_atr=1.0, max_adds=4, adds_done=adds_done):
+        add_qty = pos_state.get("qty", 0) * 0.5
+        if add_qty > 0:
+            if DRY_RUN:
+                print(f"[DRY_RUN] {symbol} PYRAMID {side} MARKET add_qty={add_qty}")
+            else:
+                ex.new_market_order(symbol=symbol, side=('BUY' if side=='LONG' else 'SELL'), quantity=add_qty)
+                ex.cancel_all(symbol)
+                ex.new_stop_market_close(symbol=symbol, side=side, stop_price=pos_state['trail'])
+            pos_state["qty"] = pos_state.get("qty",0) + add_qty
+            pos_state["adds_done"] = adds_done + 1
+            pos_state["last_add_price"] = price
+
+def fatal_auth_hint(e: Exception):
+    print("\n[FATAL] Futures API 驗證失敗 -> {0}".format(e))
+    print("\n請檢查：\n"
+          "1) 是否使用主網金鑰（本程式已固定 TESTNET=False）。\n"
+          "2) API 金鑰是否勾選『允許期貨交易』。\n"
+          "3) 是否啟用 IP 白名單導致雲端 IP 不在白名單。\n"
+          "4) 金鑰/密鑰是否貼錯或含空白。")
+    sys.exit(1)
 
 def main():
-    # 讀取環境變數
-    api_key = os.getenv("BINANCE_API_KEY")
-    api_secret = os.getenv("BINANCE_API_SECRET")
-    testnet = os.getenv("TESTNET", "true").lower() == "true"
-    dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
-    exit_on_auth_error = os.getenv("EXIT_ON_AUTH_ERROR", "true").lower() == "true"
+    if not API_KEY or not API_SECRET:
+        print("[FATAL] Please set BINANCE_API_KEY / BINANCE_API_SECRET"); sys.exit(1)
 
-    symbols = os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,TONUSDT,SUIUSDT").split(",")
+    ex = Exchange(API_KEY, API_SECRET, testnet=TESTNET)
+    print(f"Booting... TESTNET={TESTNET} DRY_RUN={DRY_RUN}")
+    print(f"Using FUTURES_URL: {ex.client.FUTURES_URL}")
 
-    exch = Exchange(api_key, api_secret, testnet=testnet, dry_run=dry_run)
+    # 啟動健康檢查（授權錯直接退出）
+    try:
+        bal = ex.health_check()
+        print(f"API health check: OK (wallet={bal} USDT)")
+    except BinanceAPIException as e:
+        if EXIT_ON_AUTH_ERROR:
+            fatal_auth_hint(e)
+        else:
+            print(f"[WARN] health_check failed: {e}")
 
-    print(f"Monitoring symbols: {symbols} | TESTNET={testnet} DRY_RUN={dry_run}")
+    # Set One-Way + filters
+    try:
+        ex.set_one_way_mode()
+    except BinanceAPIException as e:
+        print(f"[WARN] set_one_way_mode failed: {e}")
+    try:
+        ex.prime_filters()
+    except Exception as e:
+        print(f"[WARN] prime_filters failed: {e}")
 
-    # 啟動前 API 健檢
-    if not exch.check_connection():
-        print("[ERROR] 無法通過 API 驗證，請檢查：")
-        print("  1. 是否主網金鑰但 TESTNET=true？")
-        print("  2. API 是否勾選期貨交易？")
-        print("  3. 是否設定了 IP 白名單？")
-        print("  4. API Key / Secret 是否有多餘空格？")
-        if exit_on_auth_error:
-            return
+    symbols = pick_symbols(ex)
+    print(f"Monitoring symbols: {symbols}")
 
-    # 模擬訊號
-    for sym in symbols:
-        trend_signal = generate_trend_signal(sym)
-        revert_signal = generate_revert_signal(sym)
-        print(f"[{sym}] Trend={trend_signal} | Revert={revert_signal}")
+    state = load_state()
+    for s in symbols:
+        try:
+            ex.set_leverage(s, LEVERAGE)
+        except BinanceAPIException as e:
+            print(f"[WARN] set_leverage {s} failed: {e}")
+
+    while True:
+        try:
+            try:
+                equity = ex.account_balance() or BASE_EQUITY
+            except BinanceAPIException as e:
+                print(f"[WARN] account_balance failed: {e}")
+                equity = BASE_EQUITY
+
+            for sym in symbols:
+                try:
+                    kl = ex.klines(sym, interval=TIMEFRAME, limit=max(EMA_SLOW, DONCHIAN_LEN, ATR_LEN)+5)
+                    df = build_df(kl)
+                    sig, info = generate_signal(df, EMA_FAST, EMA_SLOW, DONCHIAN_LEN, ATR_LEN)
+                    last_price = info["entry_price"]
+                    atr_val = info["atr"]
+                    if math.isnan(atr_val) or atr_val <= 0:
+                        continue
+
+                    pos = state["positions"].get(sym, {})
+                    side = pos.get("side")
+
+                    if not side:
+                        if sig in ("LONG","SHORT"):
+                            qty_calc = compute_position_size(equity, RISK_PCT, atr_val, last_price, sig, sym, ex)
+                            if qty_calc > 0:
+                                _ = place_entry_and_sl(ex, sym, sig, qty_calc, last_price, atr_val)
+                                state["positions"][sym] = {
+                                    "side": sig,
+                                    "qty": qty_calc,
+                                    "entry_price": last_price,
+                                    "trail": initial_stop(last_price, atr_val, sig, ATR_MULT_SL),
+                                    "adds_done": 0,
+                                    "last_add_price": last_price
+                                }
+                                print(f"[{sym}] OPEN {sig} qty={qty_calc} reason={info['reason']} entry={last_price} ATR={atr_val}")
+                    else:
+                        manage_trailing_and_pyramid(ex, sym, side, df, state["positions"][sym])
+                        trail = state["positions"][sym].get("trail")
+                        if trail is not None and ((side=='LONG' and last_price <= trail) or (side=='SHORT' and last_price >= trail)):
+                            print(f"[{sym}] EXIT detected by price<=trail. Clearing state.")
+                            state["positions"][sym] = {}
+
+                except Exception as e_sym:
+                    print(f"[ERR] symbol {sym}: {e_sym}")
+
+            save_state(state)
+            time.sleep(LOOP_SLEEP_SECS)
+
+        except KeyboardInterrupt:
+            print("bye"); break
+        except Exception as e:
+            print(f"[LOOP ERR] {e}"); time.sleep(5)
 
 if __name__ == "__main__":
     main()
