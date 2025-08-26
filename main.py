@@ -111,7 +111,7 @@ def manage_trailing_and_pyramid(ex: Exchange, symbol: str, side: str, df: pd.Dat
 
     # 滾倉：價格每跨越 1×ATR 即加碼 50% 原口數，最多 2 次
     price = last["close"]
-    if should_pyramid(side, price, last_add_price, atr_val, step_atr=1.0, max_adds=2, adds_done=adds_done):
+    if should_pyramid(side, price, last_add_price, atr_val, step_atr=1.0, max_adds=4, adds_done=adds_done):
         add_qty = pos_state.get("qty", 0) * 0.5
         if add_qty > 0:
             if DRY_RUN:
