@@ -1,3 +1,16 @@
+# 在 main.py 最上面其它 import 後面加
+import requests
+def _print_egress_ip():
+    try:
+        ip = requests.get("https://api.ipify.org", timeout=5).text.strip()
+        geo = requests.get("https://ipapi.co/json", timeout=5).json()
+        print(f"[NET] Egress IP = {ip} | Country={geo.get('country_name')} | City={geo.get('city')} | ASN={geo.get('asn')}")
+    except Exception as e:
+        print(f"[NET] 無法偵測出口 IP: {e}")
+
+# 在 main() 最一開始呼叫：
+_print_egress_ip()
+
 import os, time, math, sys
 from typing import List, Dict, Any
 import pandas as pd
