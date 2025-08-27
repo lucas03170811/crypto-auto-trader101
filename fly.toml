@@ -1,0 +1,25 @@
+app = "binance-trading-bot"   # 你可以改成自己想要的 app 名稱
+primary_region = "nrt"        # 🚨 Tokyo (nrt)，也可以換 fra (Frankfurt)
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  TESTNET = "False"
+  DRY_RUN = "False"
+
+[experimental]
+  auto_rollback = true
+
+[[services]]
+  http_checks = []
+  internal_port = 8080
+  processes = ["app"]
+  protocol = "tcp"
+  script_checks = []
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
