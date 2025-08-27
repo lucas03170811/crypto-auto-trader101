@@ -1,4 +1,4 @@
-app = "binance-trading-bot"   # 你可以改成自己想要的 app 名稱
+app = "crypto-auto-trader101"   # 你可以改成自己想要的 app 名稱
 primary_region = "nrt"        # 🚨 Tokyo (nrt)，也可以換 fra (Frankfurt)
 
 [build]
