@@ -4,17 +4,17 @@ FROM python:3.11-slim
 # 設定工作目錄
 WORKDIR /app
 
-# 安裝系統套件 (如果需要，例如 TA-Lib 可在這裡加)
+# 安裝系統套件 (例如 TA-Lib 需要 build-essential)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# 安裝 Python 套件
+# 複製需求檔案並安裝
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 複製專案檔案
 COPY . .
 
-# 啟動 bot
+# 預設啟動 bot
 CMD ["python", "main.py"]
